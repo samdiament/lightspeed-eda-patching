@@ -1,0 +1,28 @@
+---
+- name: Remediate Specific CVEs from Red Hat Lightspeed
+  hosts: localhost
+  sources:
+    - redhat.insights_eda.insights:
+        host: 0.0.0.0
+        port: 5000
+
+  rules:
+    - name: Patch Specific CVE Detected by Lightspeed
+      condition: >-
+        (event.payload.data.application | default(event.payload.application)) == "vulnerability" and
+        (event.payload.data.event_type | default(event.payload.event_type)) in
+        ["new-cve", "any-cve-known-exploit", "new-cve-cvss", "new-cve-severity"]
+      action:
+        run_job_template:
+          name: "Patch RHEL Host from Lightspeed"
+          organization: "Default"
+          job_args:
+            limit: "{{ (event.payload.data | default(event.payload)).context.display_name }}"
+            extra_vars:
+              target_host: "{{ (event.payload.data | default(event.payload)).context.display_name }}"
+              lightspeed_event_type: "{{ (event.payload.data | default(event.payload)).event_type }}"
+              lightspeed_host_url: "{{ (event.payload.data | default(event.payload)).context.host_url | default('') }}"
+              lightspeed_events: "{{ (event.payload.data | default(event.payload)).events | default([]) }}"
+          labels:
+            - "Lightspeed-CVE-Patch"
+            - "{{ (event.payload.data | default(event.payload)).event_type }}"

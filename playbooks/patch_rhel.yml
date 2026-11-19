@@ -1,0 +1,87 @@
+---
+- name: Resolve Vulnerable Packages from CVE(s) and Patch via DNF Module
+  hosts: "{{ target_host }}"
+  become: true
+  gather_facts: true
+
+  vars:
+    raw_cves: >-
+      {{
+        (
+          (lightspeed_events | default([]) | map(attribute='payload.reported_synopses', default=[]) | flatten) +
+          (lightspeed_events | default([]) | map(attribute='payload.synopsis', default='') | list)
+        )
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
+    valid_cves: "{{ raw_cves | select('match', '^CVE-\\d{4}-\\d+$') | list }}"
+
+  tasks:
+    - name: Fail if No Valid CVE IDs Were Provided in Event Payload
+      ansible.builtin.fail:
+        msg: "No valid CVE IDs found in Lightspeed payload. Raw events: {{ lightspeed_events | default([]) }}"
+      when: valid_cves | length == 0
+
+    - name: Resolve Affected Installed Package Names from CVE(s)
+      ansible.builtin.command:
+        cmd: >-
+          dnf repoquery --upgrades
+          --cves={{ valid_cves | join(',') }}
+          --queryformat '%{name}\n' -q
+      register: cve_pkg_query
+      changed_when: false
+
+    - name: Build Deduplicated List of Vulnerable Packages
+      ansible.builtin.set_fact:
+        vulnerable_packages: >-
+          {{
+            cve_pkg_query.stdout_lines
+            | map('trim')
+            | reject('equalto', '')
+            | unique
+            | list
+          }}
+
+    - name: Display Red Hat Lightspeed Trigger and Resolved Packages
+      ansible.builtin.debug:
+        msg:
+          - "Target Host: {{ inventory_hostname }} ({{ ansible_distribution }} {{ ansible_distribution_version }})"
+          - "Event Type: {{ lightspeed_event_type | default('manual-run') }}"
+          - "Target CVE(s): {{ valid_cves | join(', ') }}"
+          - "Resolved RPM Package(s): {{ vulnerable_packages if vulnerable_packages | length > 0 else ['None - already remediated'] }}"
+          - "Lightspeed URL: {{ lightspeed_host_url | default('N/A') }}"
+
+    - name: Update Vulnerable Package(s) via Native DNF Module
+      ansible.builtin.dnf:
+        name: "{{ vulnerable_packages }}"
+        state: latest
+        update_cache: true
+      register: dnf_patch_result
+      when: vulnerable_packages | length > 0
+
+    - name: Show DNF Module Package Changes
+      ansible.builtin.debug:
+        var: dnf_patch_result.results
+      when: vulnerable_packages | length > 0
+
+    - name: Check if Reboot is Required
+      ansible.builtin.command:
+        cmd: needs-restarting -r
+      register: reboot_check
+      failed_when: false
+      changed_when: false
+      when: vulnerable_packages | length > 0
+
+    - name: Reboot Host if Kernel or Core Libraries Were Updated
+      ansible.builtin.reboot:
+        msg: "Rebooting after Red Hat Lightspeed remediation ({{ vulnerable_packages | join(', ') }})"
+        reboot_timeout: 300
+      when:
+        - vulnerable_packages | length > 0
+        - reboot_check.rc == 1
+
+    - name: Refresh Red Hat Lightspeed Inventory and Vulnerability State
+      ansible.builtin.command:
+        cmd: insights-client
+      changed_when: true
