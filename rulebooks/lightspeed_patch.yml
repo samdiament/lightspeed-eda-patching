@@ -9,9 +9,15 @@
   rules:
     - name: Patch Specific CVE Detected by Lightspeed
       condition: >-
-        (event.payload.data.application | default(event.payload.application)) == "vulnerability" and
-        (event.payload.data.event_type | default(event.payload.event_type)) in
-        ["new-cve", "any-cve-known-exploit", "new-cve-cvss", "new-cve-severity"]
+        (
+          event.payload.data.application is defined and
+          event.payload.data.application == "vulnerability" and
+          event.payload.data.event_type in ["new-cve", "any-cve-known-exploit", "new-cve-cvss", "new-cve-severity"]
+        ) or (
+          event.payload.application is defined and
+          event.payload.application == "vulnerability" and
+          event.payload.event_type in ["new-cve", "any-cve-known-exploit", "new-cve-cvss", "new-cve-severity"]
+        )
       action:
         run_job_template:
           name: "Patch RHEL Host from Lightspeed"
