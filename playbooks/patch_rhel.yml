@@ -8,6 +8,7 @@
     raw_cves: >-
       {{
         (
+          (lightspeed_events | default([]) | map(attribute='payload.reported_cve', default='') | list) +
           (lightspeed_events | default([]) | map(attribute='payload.reported_synopses', default=[]) | flatten) +
           (lightspeed_events | default([]) | map(attribute='payload.synopsis', default='') | list)
         )
