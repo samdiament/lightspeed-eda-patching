@@ -1,0 +1,136 @@
+---
+- name: Prepare Satellite Content View Errata Before Human Approval
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    sat_url: "{{ lookup('env', 'SATELLITE_SERVER') }}"
+    sat_user: "{{ lookup('env', 'SATELLITE_USERNAME') }}"
+    sat_pass: "{{ lookup('env', 'SATELLITE_PASSWORD') }}"
+    incoming_cves: >-
+      {{
+        (lightspeed_events | default([]) | map(attribute='payload.reported_cve', default='') | list)
+        | reject('equalto', '')
+        | select('match', '^CVE-\d{4}-\d+$')
+        | unique
+        | list
+      }}
+
+  tasks:
+    - name: Look up target host in Red Hat Satellite
+      ansible.builtin.uri:
+        url: "{{ sat_url }}/api/v2/hosts/{{ target_host }}"
+        method: GET
+        user: "{{ sat_user }}"
+        password: "{{ sat_pass }}"
+        force_basic_auth: true
+        validate_certs: false
+        status_code: [200, 404]
+      register: sat_host_lookup
+
+    - name: Handle hosts not managed by Satellite (e.g. RHUI nodes)
+      when: sat_host_lookup.status == 404
+      block:
+        - name: Publish RHUI pass-through review summary
+          ansible.builtin.set_stats:
+            data:
+              satellite_managed: false
+              content_promoted: false
+              review_summary: >-
+                Host {{ target_host }} is RHUI-managed (not registered in Satellite).
+                Ready for human approval to patch {{ incoming_cves | length }} CVE(s).
+
+        - name: End Satellite stage cleanly for RHUI host
+          ansible.builtin.meta: end_play
+
+    - name: Extract Satellite host, Content View, and Lifecycle Environment IDs
+      ansible.builtin.set_fact:
+        sat_host_id: "{{ sat_host_lookup.json.id }}"
+        sat_cv_name: "{{ sat_host_lookup.json.content_facet_attributes.content_view.name }}"
+        sat_cv_version_id: "{{ sat_host_lookup.json.content_facet_attributes.content_view_version_id }}"
+        sat_lce_id: "{{ sat_host_lookup.json.content_facet_attributes.lifecycle_environment.id }}"
+        sat_lce_name: "{{ sat_host_lookup.json.content_facet_attributes.lifecycle_environment.name }}"
+
+    - name: Query Satellite for applicable errata NOT yet installable in host's Content View
+      ansible.builtin.uri:
+        url: "{{ sat_url }}/api/v2/hosts/{{ sat_host_id }}/errata?installable=false&per_page=500"
+        method: GET
+        user: "{{ sat_user }}"
+        password: "{{ sat_pass }}"
+        force_basic_auth: true
+        validate_certs: false
+      register: unpromoted_errata_resp
+
+    - name: Identify unpromoted Satellite errata IDs matching incoming Lightspeed CVEs
+      ansible.builtin.set_fact:
+        errata_to_promote: >-
+          {%- set matched = [] -%}
+          {%- for erratum in unpromoted_errata_resp.json.results | default([]) -%}
+            {%- set erratum_cves = erratum.cves | default([]) | map(attribute='cve_id') | list -%}
+            {%- if (erratum_cves | intersect(incoming_cves) | length) > 0 -%}
+              {%- set _ = matched.append(erratum.errata_id) -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {{ matched | unique | list }}
+
+    - name: Incrementally update Content View and promote missing CVE errata to host's environment
+      when: errata_to_promote | length > 0
+      block:
+        - name: Trigger Katello incremental Content View update
+          ansible.builtin.uri:
+            url: "{{ sat_url }}/katello/api/content_view_versions/incremental_update"
+            method: POST
+            user: "{{ sat_user }}"
+            password: "{{ sat_pass }}"
+            force_basic_auth: true
+            validate_certs: false
+            body_format: json
+            status_code: [200, 202]
+            body:
+              content_view_version_environments:
+                - content_view_version_id: "{{ sat_cv_version_id | int }}"
+                  environment_ids:
+                    - "{{ sat_lce_id | int }}"
+              add_content:
+                errata_ids: "{{ errata_to_promote }}"
+              resolve_dependencies: true
+          register: incremental_task
+
+        - name: Wait for incremental Content View publish and promote task to complete
+          ansible.builtin.uri:
+            url: "{{ sat_url }}/foreman_tasks/api/tasks/{{ incremental_task.json.id }}"
+            method: GET
+            user: "{{ sat_user }}"
+            password: "{{ sat_pass }}"
+            force_basic_auth: true
+            validate_certs: false
+          register: task_status
+          until: task_status.json.state == "stopped"
+          retries: 40
+          delay: 15
+
+        - name: Verify incremental update succeeded
+          ansible.builtin.assert:
+            that:
+              - task_status.json.result == "success"
+            fail_msg: "Satellite incremental update failed: {{ task_status.json.humanized.errors | default('Unknown error') }}"
+
+    - name: Publish review summary for the Human Approval step
+      ansible.builtin.set_stats:
+        data:
+          satellite_managed: true
+          content_promoted: "{{ (errata_to_promote | length) > 0 }}"
+          promoted_errata: "{{ errata_to_promote }}"
+          review_summary: >-
+            Host {{ target_host }} (CV: {{ sat_cv_name }}, Env: {{ sat_lce_name }}) —
+            {{
+              'Promoted ' ~ (errata_to_promote | length) ~ ' missing errata (' ~ (errata_to_promote | join(', ')) ~ ') into ' ~ sat_lce_name ~ '.'
+              if (errata_to_promote | length) > 0
+              else 'All incoming CVE errata are already available in ' ~ sat_cv_name ~ ' (' ~ sat_lce_name ~ ').'
+            }}
+            Ready for human approval to run DNF remediation.
+
+    - name: Display summary for workflow reviewer
+      ansible.builtin.debug:
+        var: review_summary
