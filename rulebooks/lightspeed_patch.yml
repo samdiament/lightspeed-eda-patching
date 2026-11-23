@@ -15,7 +15,7 @@
         event.payload.source.event_type.display_name in ["System vulnerability", "New CVE", "Any CVE with known exploit"]
       action:
         run_workflow_template:
-          name: "Patch RHEL Host from Lightspeed"
+          name: "Lightspeed CVE Remediation Workflow"
           organization: "Default"
           job_args:
             limit: "{{ event.payload.context.display_name }}"
